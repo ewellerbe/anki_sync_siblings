@@ -1,178 +1,130 @@
-﻿# Reschedules siblings so that they always appear together.
-# Useful for language learning decks
+# Reschedules siblings so that they always appear together
+# Useful for language learning decks (functions like Wanikani)
 
-from typing import List
-from dataclasses import dataclass
 from typing import Sequence
-from anki.decks import DeckManager
 from typing import Sequence, Callable
 
 from anki.cards import Card
-from anki.consts import REVLOG_RESCHED
 from aqt import mw, gui_hooks
-from aqt.utils import tooltip
 from aqt.qt import QAction
-
 
 from .configuration import (
     Config,
     config_change,
 )
 
-moved_cards = []  # Cards moved
+moved_notes = [] # Cards moved
 done_cards = []  # Cards marked correct
-synchronized_pairs = set() # Notes synced
-
+initial_sync = False
 
 def get_siblings(card: Card) -> Sequence[Card]:
     card_ids = card.col.db.list("select id from cards where nid=? and id!=?",
                                 card.nid, card.id)
     return [mw.col.get_card(card_id) for card_id in card_ids]
 
-def move_siblings(siblings: Sequence[Card]):
-    card = mw.reviewer.card
 
+def move_cards_before_review(card: Card, siblings: Sequence[Card]):
+    moved_notes.append(card.nid)
     for sibling in siblings:
-        # Move non-new siblings not previously moved or currently in review
-        if sibling.id not in moved_cards and sibling.queue != 0 and sibling.due > mw.col.sched.today:
-            sibling.due = mw.col.sched.today
-            moved_cards.append(sibling.id)
-            sibling.flush()
+        sibling.due = mw.col.sched.today
+        sibling.flush()
 
 
-# Sync's all notes, useful for cross-saves
 def sync_deck():
     current_deck = mw.col.decks.current()["name"]
+    notes = mw.col.find_notes(f'deck:"{current_deck}" is:learn OR is:review')
 
-    # List of learning notes
-    learning_notes = mw.col.find_notes(f'deck:"{current_deck}" is:learn')
-   
-    for note_id in learning_notes:
+    for note_id in notes:
         note = mw.col.getNote(note_id)
-        
-        # Skip suspended, buried, and solo cards
+    
         note_cards = note.cards()
-        if len(note_cards) == 1 or any(card.queue < 0 for card in note.cards()): 
-            continue
-      
-        min_queue = min(card.queue for card in note_cards)
-        max_left = max(card.left for card in note_cards)
-        min_due = float('inf')
-
-        # Reverted learn cards are due in 1969.. 
-        for card in note_cards:
-            if 946684800 < card.due < min_due:
-                min_due = card.due
-         
-        # Sync siblings
-        for card in note.cards():
-            card.queue = card.type = min_queue
-            card.left = max_left
-            card.due = min_due
-            card.flush()
-
-    # Repeat for review cards
-    review_notes = mw.col.find_notes(f'deck:"{current_deck}" is:review')
-
-    for note_id in review_notes:
-        note = mw.col.getNote(note_id)
-
-        note_cards = note.cards()
-        if len(note_cards) == 1  or any(card.queue < 0 for card in note.cards()): 
+        if len(note_cards) == 1 or any(card.queue < 0 for card in note.cards()):
             continue
 
-        min_ivl = min(card.queue for card in note_cards)
-        min_due = min(card.left for card in note_cards)
+        card_to_replicate = note_cards[0]
+        for sibling in note_cards:
+            if card_to_replicate.type == sibling.type:
+                if card_to_replicate.type == 1: # Learn Card
+                    card_to_replicate =  max([card_to_replicate, sibling], key=lambda card: card.left)
+                elif card_to_replicate.type == 2: # Review Card
+                    card_to_replicate =  min([card_to_replicate, sibling], key=lambda card: card.ivl)
+            else:
+                card_to_replicate =  min([card_to_replicate, sibling], key=lambda card: card.type)
+     
+        for child in note_cards:
+            child.queue = child.type = card_to_replicate.type
+            child.ivl = card_to_replicate.ivl
+            child.left = card_to_replicate.left
+            child.due = card_to_replicate.due
+            child.flush()
 
-        for card in note.cards():
-            card.ivl = min_ivl
-            card.due = min_due
-    
-    mw.reset()
+        mw.reset()
 
 
-def get_learning_interval(card):
-    if card.type == 1:
-        col = card.col
+def sync_siblings(card:Card, siblings: Sequence[Card]):
+    all_cards_done = True
+    card_to_replicate = card
 
-        # Retrieve deck configuration
-        deck_conf_id = card.did
-        deck_manager = DeckManager(col)
-        deck_config = deck_manager.config_dict_for_deck_id(deck_conf_id)
-
-        # Learning intervals
-        lapse_delays = deck_config['new']['delays']
-
-        # Steps saved: remaining learning phase steps
-        current_step_index = len(lapse_delays) - card.left
-        
-        # Constraints check
-        if 0 <= current_step_index < len(lapse_delays):
-            current_step_time = int(lapse_delays[current_step_index])
-            return current_step_time
-
-    return len(lapse_delays) # Default: Restart learning phrase
-
-    
-def sync_siblings(card: Card, siblings: Sequence[Card]):
-    
     for sibling in siblings:
+        if sibling.id not in done_cards:
+            all_cards_done = False
 
-        card_pair = frozenset({card.id, sibling.id})
-        if card_pair not in synchronized_pairs and card.id in done_cards and sibling.id in done_cards:
-            
-            # Ensures that both cards graduate together
-            if card.queue == 1 and sibling.queue == 2:
-                sibling.type = sibling.queue = 1
-                sibling.left = card.left
-                sibling.due = card.due
-            elif card.queue == 2 and sibling.queue == 1:
-                card.type = card.queue = 1
-                card.left = sibling.left
-                card.due = sibling.due
-            # Ensures review/learn cards stay on the same scheduling cycle
-            elif card.queue != 0 and card.queue == sibling.queue and card.due != sibling.due:
-                max_step = max(card.left, sibling.left)
-                card.left = sibling.left = max_step
+            if card_to_replicate.type == sibling.type:
+                if card_to_replicate.type == 1: # Learn Card
+                    card_to_replicate =  max([card_to_replicate, sibling], key=lambda card: card.left)
+                elif card_to_replicate.type == 2: # Review Card
+                    card_to_replicate =  min([card_to_replicate, sibling], key=lambda card: card.ivl)
+            else:
+                card_to_replicate =  min([card_to_replicate, sibling], key=lambda card: card.type)
 
-                min_ivl = min(card.ivl, sibling.ivl)
-                card.ivl = sibling.ivl = min_ivl
-                
-                next_due = min(card.due, sibling.due)
-                card.due = sibling.due = next_due
-
-            card.flush()
-            sibling.flush()
-            synchronized_pairs.add(card_pair)
+    children = siblings + [card] # Add the original card first
+    if all_cards_done:
+        for child in children:
+            child.queue = child.type = card_to_replicate.type
+            child.ivl = card_to_replicate.ivl
+            child.left = card_to_replicate.left
+            child.due = card_to_replicate.due
+            child.flush()
 
 @gui_hooks.reviewer_did_answer_card.append
 def reviewer_did_answer_card(reviewer: "Reviewer", card: Card, ease: int) -> None:
-    # Card Answered Correctly
+    if not config.enabled_for_current_deck:
+        return
+
     if ease != 1:
         done_cards.append(card.id)
         siblings = get_siblings(card)
-        card.flush()
         sync_siblings(card, siblings)
-        
+
+
+
+@gui_hooks.reviewer_did_show_question.append
+def reviewer_did_show_question(card: Card):
+    global initial_sync
+
+    if not config.enabled_for_current_deck or initial_sync:
+        return
+
+    current_deck = mw.col.decks.current()["name"]
+    due_cards = mw.col.find_cards(f'deck:"{current_deck}" is:due')
+
+    initial_sync = True
+    for due_card in due_cards:
+        due_card = mw.col.getCard(due_card)
+        if due_card.nid not in moved_notes:
+            siblings = get_siblings(due_card)
+            move_cards_before_review(due_card, siblings)
+
+    mw.reset()
+    
 
 # Clear records on review wrap up
 @gui_hooks.reviewer_will_end.append
 def reviewer_will_end() -> None:
-    moved_cards.clear()
+    global initial_sync
+    initial_sync = False
+    moved_notes.clear()
     done_cards.clear()
-    synchronized_pairs.clear()
-   
-# First action
-@gui_hooks.reviewer_did_show_answer.append
-def reviewer_did_show_answer(card: Card):
-    if not config.enabled_for_current_deck:
-        return
-
-    siblings = get_siblings(card)
-    moved_cards.append(card.id)
-    move_siblings(siblings)
-
-
 
 config = Config()
 config.load()
