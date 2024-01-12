@@ -1,8 +1,5 @@
 from typing import Sequence
-import json
-
 from aqt import mw
-from aqt.utils import showWarning
 
 ENABLED_FOR_DECKS = "enabled_for_decks"
 
@@ -48,4 +45,4 @@ class Config:
 
 def config_change(function):
     mw.addonManager.setConfigUpdatedAction(__name__, lambda *_: function())
-
+    
